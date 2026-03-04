@@ -547,8 +547,10 @@ with col1:
     st.subheader("1. Base de datos")
     excel_file = st.file_uploader("Sube el Excel con los datos", type=["xlsx", "xls", "xlsm"])
 
-    hoja_sel = None
-    campo_nombre = "nombre"
+    hoja_sel      = None
+    campo_nombre  = "nombre"
+    encabezados   = []
+    datos_filas   = []
 
     if excel_file:
         try:
@@ -559,6 +561,25 @@ with col1:
             excel_file.seek(0)
             hoja_sel = st.selectbox("Hoja", hojas)
             campo_nombre = st.text_input("Campo nombre (para nombrar archivos)", value="nombre")
+
+            # Leer filas para preview y filtro
+            excel_file.seek(0)
+            wb2 = openpyxl.load_workbook(io.BytesIO(excel_file.read()), data_only=True)
+            ws2 = wb2[hoja_sel]
+            filas_raw = list(ws2.iter_rows(values_only=True))
+            wb2.close()
+            excel_file.seek(0)
+
+            if filas_raw:
+                encabezados = [str(c).strip() if c is not None else f"col_{i}"
+                               for i, c in enumerate(filas_raw[0])]
+                datos_filas = [
+                    {encabezados[i]: fila[i] for i in range(len(encabezados))}
+                    for fila in filas_raw[1:]
+                    if any(v is not None for v in fila)
+                ]
+                st.caption(f"✔ {len(datos_filas)} filas cargadas")
+
         except Exception as e:
             st.error(f"No se pudo leer el Excel: {e}")
 
@@ -577,6 +598,57 @@ firmas_files = st.file_uploader(
     accept_multiple_files=True
 )
 
+# ── Filtro ──
+st.subheader("4. Filtro (opcional)")
+
+datos_filtrados = datos_filas  # por defecto: todas las filas
+
+if datos_filas and encabezados:
+    col_f1, col_f2 = st.columns([1, 2])
+
+    with col_f1:
+        usar_filtro = st.checkbox("Filtrar filas antes de generar")
+
+    if usar_filtro:
+        with col_f1:
+            columna_filtro = st.selectbox("Columna a filtrar", encabezados)
+
+        if columna_filtro:
+            # Valores únicos de esa columna (formateados para mostrar)
+            valores_unicos = sorted(
+                set(
+                    formatear_valor(fila.get(columna_filtro))
+                    for fila in datos_filas
+                    if fila.get(columna_filtro) is not None and str(fila.get(columna_filtro)).strip() != ""
+                )
+            )
+
+            with col_f2:
+                valores_sel = st.multiselect(
+                    f"Valores de '{columna_filtro}' a incluir",
+                    options=valores_unicos,
+                    default=valores_unicos,
+                    help="Selecciona uno o varios valores. Solo se generarán documentos para las filas que coincidan."
+                )
+
+            if valores_sel:
+                datos_filtrados = [
+                    fila for fila in datos_filas
+                    if formatear_valor(fila.get(columna_filtro)) in valores_sel
+                ]
+                st.info(f"🔎 {len(datos_filtrados)} de {len(datos_filas)} filas seleccionadas con el filtro")
+            else:
+                datos_filtrados = []
+                st.warning("No hay valores seleccionados. No se generará ningún documento.")
+
+    # Preview de filas que se van a procesar
+    with st.expander(f"👁 Ver filas a procesar ({len(datos_filtrados)})", expanded=False):
+        if datos_filtrados:
+            import pandas as pd
+            st.dataframe(pd.DataFrame(datos_filtrados), use_container_width=True)
+        else:
+            st.write("Sin filas.")
+
 # ── Botón generar ──
 st.divider()
 generar = st.button("⚡ GENERAR DOCUMENTOS", type="primary", use_container_width=True)
@@ -588,6 +660,8 @@ if generar:
         st.warning("Selecciona la hoja.")
     elif not plantillas_files:
         st.warning("Sube al menos una plantilla.")
+    elif not datos_filtrados:
+        st.warning("No hay filas para procesar. Revisa el filtro.")
     else:
         log_area = st.empty()
         logs = []
@@ -601,68 +675,49 @@ if generar:
         for f in (firmas_files or []):
             firmas_dict[f.name] = f.read()
 
-        # Leer Excel
         try:
-            import openpyxl
-            excel_file.seek(0)
-            wb = openpyxl.load_workbook(io.BytesIO(excel_file.read()), data_only=True)
-            ws = wb[hoja_sel]
-            filas = list(ws.iter_rows(values_only=True))
-            wb.close()
+            log(f"✔ {len(datos_filtrados)} filas a procesar | Campos: {', '.join(encabezados)}")
+            log(f"✔ Firmas cargadas: {list(firmas_dict.keys()) or 'ninguna'}")
 
-            if not filas:
-                st.error("La hoja está vacía.")
-            else:
-                encabezados = [str(c).strip() if c is not None else f"col_{i}"
-                               for i, c in enumerate(filas[0])]
-                datos_filas = [
-                    {encabezados[i]: fila[i] for i in range(len(encabezados))}
-                    for fila in filas[1:]
-                    if any(v is not None for v in fila)
-                ]
+            # Generar archivos y empaquetar en ZIP
+            zip_buffer = io.BytesIO()
+            total = 0
 
-                log(f"✔ {len(datos_filas)} filas | Campos: {', '.join(encabezados)}")
-                log(f"✔ Firmas cargadas: {list(firmas_dict.keys()) or 'ninguna'}")
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zout:
+                for plantilla_file in plantillas_files:
+                    plantilla_nombre = plantilla_file.name
+                    plantilla_bytes  = plantilla_file.read()
+                    log(f"\n📄 {plantilla_nombre}")
 
-                # Generar archivos y empaquetar en ZIP
-                zip_buffer = io.BytesIO()
-                total = 0
+                    for i, fila in enumerate(datos_filtrados):
+                        try:
+                            nombre_arch, contenido = procesar_plantilla(
+                                plantilla_nombre, plantilla_bytes, fila,
+                                firmas_dict, campo_nombre, log
+                            )
+                            if nombre_arch and contenido:
+                                valor_firma = formatear_valor(fila.get("firma", ""))
+                                _, img_ext_found = encontrar_firma(valor_firma, firmas_dict)
+                                subcarpeta = "con_firma" if img_ext_found else "sin_firma"
+                                ruta_zip = f"{os.path.splitext(plantilla_nombre)[0]}/{subcarpeta}/{nombre_arch}"
+                                zout.writestr(ruta_zip, contenido)
+                                log(f"   ✔ {ruta_zip}")
+                                total += 1
+                        except Exception as e:
+                            import traceback
+                            log(f"   ❌ Fila {i+2}: {e}")
+                            log(traceback.format_exc())
 
-                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zout:
-                    for plantilla_file in plantillas_files:
-                        plantilla_nombre = plantilla_file.name
-                        plantilla_bytes = plantilla_file.read()
-                        log(f"\n📄 {plantilla_nombre}")
+            log(f"\n✅ {total} archivos generados")
 
-                        for i, fila in enumerate(datos_filas):
-                            try:
-                                nombre_arch, contenido = procesar_plantilla(
-                                    plantilla_nombre, plantilla_bytes, fila,
-                                    firmas_dict, campo_nombre, log
-                                )
-                                if nombre_arch and contenido:
-                                    # Subcarpeta con/sin firma según si tiene firma
-                                    valor_firma = formatear_valor(fila.get("firma", ""))
-                                    _, img_ext = encontrar_firma(valor_firma, firmas_dict)
-                                    subcarpeta = "con_firma" if img_ext else "sin_firma"
-                                    ruta_zip = f"{os.path.splitext(plantilla_nombre)[0]}/{subcarpeta}/{nombre_arch}"
-                                    zout.writestr(ruta_zip, contenido)
-                                    log(f"   ✔ {ruta_zip}")
-                                    total += 1
-                            except Exception as e:
-                                import traceback
-                                log(f"   ❌ Fila {i+2}: {e}")
-
-                log(f"\n✅ {total} archivos generados")
-
-                st.success(f"✅ {total} archivos generados correctamente")
-                st.download_button(
-                    label="📥 Descargar todos los documentos (.zip)",
-                    data=zip_buffer.getvalue(),
-                    file_name="documentos_generados.zip",
-                    mime="application/zip",
-                    use_container_width=True
-                )
+            st.success(f"✅ {total} archivos generados correctamente")
+            st.download_button(
+                label="📥 Descargar todos los documentos (.zip)",
+                data=zip_buffer.getvalue(),
+                file_name="documentos_generados.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
 
         except Exception as e:
             import traceback
