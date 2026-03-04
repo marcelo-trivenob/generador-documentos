@@ -119,14 +119,44 @@ def buscar_marcadores_en_xlsx(plantilla_bytes):
     return resultado, firma_info
 
 
+def _zip_copy_preservando_formato(zin, archivos_modificados):
+    """
+    Recrea el ZIP preservando el compress_type original de cada entrada.
+    Solo los archivos en archivos_modificados (dict nombre->bytes) se reemplazan.
+    El resto se copia bit a bit desde el ZIP original.
+    """
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, 'w') as zout:
+        for info in zin.infolist():
+            if info.filename in archivos_modificados:
+                # Archivo modificado: escribir nuevo contenido con compresión deflate
+                zout.writestr(
+                    zipfile.ZipInfo(info.filename),
+                    archivos_modificados[info.filename],
+                    compress_type=zipfile.ZIP_DEFLATED
+                )
+            else:
+                # Archivo sin modificar: copiar con compresión original
+                data = zin.read(info.filename)
+                zi = zipfile.ZipInfo(info.filename)
+                zi.compress_type = info.compress_type
+                zout.writestr(zi, data)
+    return out.getvalue()
+
+
 def llenar_xlsx_zip(plantilla_bytes, datos):
-    """Rellena celdas y devuelve bytes del xlsx modificado."""
+    """Rellena celdas y devuelve bytes del xlsx modificado, preservando formato."""
     SS_STR = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-    with zipfile.ZipFile(io.BytesIO(plantilla_bytes), 'r') as zin:
+
+    zin_buf = io.BytesIO(plantilla_bytes)
+    with zipfile.ZipFile(zin_buf, 'r') as zin:
         archivos = {n: zin.read(n) for n in zin.namelist()}
+
+    modificados = {}  # solo los que cambiamos
 
     if 'xl/sharedStrings.xml' in archivos:
         root = etree.fromstring(archivos['xl/sharedStrings.xml'])
+        cambio = False
         for si in root.findall(f'{{{SS_STR}}}si'):
             nodos_t = list(si.iter(f'{{{SS_STR}}}t'))
             texto = ''.join(t.text or '' for t in nodos_t)
@@ -140,12 +170,14 @@ def llenar_xlsx_zip(plantilla_bytes, datos):
                 if marcador in nuevo_texto:
                     nuevo_texto = nuevo_texto.replace(marcador, formatear_valor(valor))
             if nuevo_texto != texto:
+                cambio = True
                 if nodos_t:
                     nodos_t[0].text = nuevo_texto
                     for t in nodos_t[1:]:
                         t.text = ''
-        archivos['xl/sharedStrings.xml'] = etree.tostring(
-            root, xml_declaration=True, encoding='UTF-8', standalone=True)
+        if cambio:
+            modificados['xl/sharedStrings.xml'] = etree.tostring(
+                root, xml_declaration=True, encoding='UTF-8', standalone=True)
 
     marcadores, _ = buscar_marcadores_en_xlsx(plantilla_bytes)
     for sheet_name, celdas in marcadores.items():
@@ -155,13 +187,12 @@ def llenar_xlsx_zip(plantilla_bytes, datos):
         for cell_ref, campo in celdas.items():
             valor = datos.get(campo, "")
             sheet_xml = set_cell_in_xml(sheet_xml, cell_ref, valor)
-        archivos[sheet_name] = sheet_xml
+        modificados[sheet_name] = sheet_xml
 
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zout:
-        for nombre, contenido in archivos.items():
-            zout.writestr(nombre, contenido)
-    return out.getvalue()
+    # Reconstruir ZIP preservando compresión original de cada archivo
+    zin_buf.seek(0)
+    with zipfile.ZipFile(zin_buf, 'r') as zin:
+        return _zip_copy_preservando_formato(zin, modificados)
 
 
 def _extraer_posicion_anchor(anchor_elem):
@@ -194,26 +225,33 @@ def insertar_firmas_en_drawing_xlsx(xlsx_bytes, img_bytes, img_ext, datos, log_f
     CT_NS    = 'http://schemas.openxmlformats.org/package/2006/content-types'
     NS_PIC   = 'http://schemas.openxmlformats.org/drawingml/2006/picture'
 
-    with zipfile.ZipFile(io.BytesIO(xlsx_bytes), 'r') as z:
-        archivos = {n: z.read(n) for n in z.namelist()}
+    zin_buf = io.BytesIO(xlsx_bytes)
+    with zipfile.ZipFile(zin_buf, 'r') as zin:
+        archivos = {n: zin.read(n) for n in zin.namelist()}
 
     drawing_names = [n for n in archivos if re.match(r'xl/drawings/drawing\d+\.xml$', n)]
     if not drawing_names:
-        out = io.BytesIO()
-        with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for nombre, contenido in archivos.items():
-                zout.writestr(nombre, contenido)
-        return out.getvalue()
+        zin_buf.seek(0)
+        with zipfile.ZipFile(zin_buf, 'r') as zin:
+            return _zip_copy_preservando_formato(zin, {})
 
     mime_map = {'.png': 'image/png', '.jpg': 'image/jpeg',
                 '.jpeg': 'image/jpeg', '.bmp': 'image/bmp', '.tiff': 'image/tiff'}
-    img_mime = mime_map.get(img_ext, 'image/png')
-    img_internal_name = f"firma_img{img_ext}"
-    img_zip_path = f"xl/media/{img_internal_name}"
+
+    # Asegurar que img_ext tenga el punto
+    if img_ext and not img_ext.startswith('.'):
+        img_ext = '.' + img_ext
+
+    img_mime = mime_map.get(img_ext, 'image/png') if img_ext else 'image/png'
+    img_internal_name = f"firma_img{img_ext}" if img_ext else None
+    img_zip_path = f"xl/media/{img_internal_name}" if img_internal_name else None
+
+    modificados = {}
 
     for drawing_name in drawing_names:
         root = etree.fromstring(archivos[drawing_name])
 
+        # Reemplazar {{campo}} de texto en shapes
         for t_el in root.iter(f'{{{NS_A}}}t'):
             if not t_el.text or '{{' not in t_el.text:
                 continue
@@ -224,6 +262,7 @@ def insertar_firmas_en_drawing_xlsx(xlsx_bytes, img_bytes, img_ext, datos, log_f
                 if marcador in t_el.text:
                     t_el.text = t_el.text.replace(marcador, formatear_valor(valor))
 
+        # Buscar anchors con {{firma}}
         anchors_firma = []
         for anchor in root.findall(f'{{{XDR_NS}}}twoCellAnchor') + root.findall(f'{{{XDR_NS}}}oneCellAnchor'):
             for t_el in anchor.iter(f'{{{NS_A}}}t'):
@@ -231,16 +270,18 @@ def insertar_firmas_en_drawing_xlsx(xlsx_bytes, img_bytes, img_ext, datos, log_f
                     anchors_firma.append(anchor)
                     break
 
-        if anchors_firma and img_bytes:
-            if log_fn:
-                log_fn(f"   🔍 {len(anchors_firma)} cuadro(s) firma encontrado(s)")
+        if log_fn and anchors_firma:
+            log_fn(f"   🔍 {len(anchors_firma)} cuadro(s) {{{{firma}}}} encontrado(s)")
 
+        if anchors_firma and img_bytes and img_ext:
             drawing_basename = os.path.basename(drawing_name)
             rels_name = f"xl/drawings/_rels/{drawing_basename}.rels"
             img_target = f"../media/{img_internal_name}"
 
-            archivos[img_zip_path] = img_bytes
+            # Agregar imagen al ZIP
+            modificados[img_zip_path] = img_bytes
 
+            # Content-Types
             ct_root = etree.fromstring(archivos['[Content_Types].xml'])
             extension = img_ext.lstrip('.')
             existentes = {e.get('Extension') for e in ct_root.findall(f'{{{CT_NS}}}Default')}
@@ -248,9 +289,10 @@ def insertar_firmas_en_drawing_xlsx(xlsx_bytes, img_bytes, img_ext, datos, log_f
                 nd = etree.SubElement(ct_root, f'{{{CT_NS}}}Default')
                 nd.set('Extension', extension)
                 nd.set('ContentType', img_mime)
-            archivos['[Content_Types].xml'] = etree.tostring(
+            modificados['[Content_Types].xml'] = etree.tostring(
                 ct_root, xml_declaration=True, encoding='UTF-8', standalone=True)
 
+            # Relaciones del drawing
             if rels_name in archivos:
                 rels_root = etree.fromstring(archivos[rels_name])
             else:
@@ -265,40 +307,40 @@ def insertar_firmas_en_drawing_xlsx(xlsx_bytes, img_bytes, img_ext, datos, log_f
                 new_rel.set('Id', rel_id)
                 new_rel.set('Type', REL_TYPE)
                 new_rel.set('Target', img_target)
-            archivos[rels_name] = etree.tostring(
+            modificados[rels_name] = etree.tostring(
                 rels_root, xml_declaration=True, encoding='UTF-8', standalone=True)
 
             for anchor in anchors_firma:
                 pos = _extraer_posicion_anchor(anchor)
                 if pos is None:
                     continue
+
                 to_col    = pos.get('to_col',    pos['col'] + 2)
                 to_colOff = pos.get('to_colOff', 0)
                 to_row    = pos.get('to_row',    pos['row'] + 3)
                 to_rowOff = pos.get('to_rowOff', 0)
 
-                # Limpiar el anchor y poner la imagen
+                # Conservar <from> y <to>, eliminar resto
+                from_el_orig = anchor.find(f'{{{XDR_NS}}}from')
                 for child in list(anchor):
-                    if etree.QName(child.tag).localname not in ('from', 'to'):
-                        anchor.remove(child)
+                    anchor.remove(child)
+                if from_el_orig is not None:
+                    anchor.append(from_el_orig)
 
-                # Asegurar <to>
-                to_el = anchor.find(f'{{{XDR_NS}}}to')
-                if to_el is None:
-                    to_el = etree.SubElement(anchor, f'{{{XDR_NS}}}to')
+                # Reconstruir <to>
+                to_el = etree.SubElement(anchor, f'{{{XDR_NS}}}to')
                 for tag, val in [('col', to_col), ('colOff', to_colOff),
                                   ('row', to_row), ('rowOff', to_rowOff)]:
-                    child = to_el.find(f'{{{XDR_NS}}}{tag}')
-                    if child is None:
-                        child = etree.SubElement(to_el, f'{{{XDR_NS}}}{tag}')
+                    child = etree.SubElement(to_el, f'{{{XDR_NS}}}{tag}')
                     child.text = str(val)
 
+                # Insertar imagen
                 pic_id = 100
                 pic_xml = (
                     f'<xdr:pic xmlns:xdr="{XDR_NS}" xmlns:a="{NS_A}" xmlns:r="{NS_R}" xmlns:pic="{NS_PIC}">'
                     f'<xdr:nvPicPr>'
                     f'<xdr:cNvPr id="{pic_id}" name="firma_img"/>'
-                    f'<xdr:cNvPicPr/>'
+                    f'<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr>'
                     f'</xdr:nvPicPr>'
                     f'<xdr:blipFill>'
                     f'<a:blip r:embed="{rel_id}"/>'
@@ -311,17 +353,17 @@ def insertar_firmas_en_drawing_xlsx(xlsx_bytes, img_bytes, img_ext, datos, log_f
                     f'</xdr:pic>'
                 )
                 anchor.append(etree.fromstring(pic_xml))
+                etree.SubElement(anchor, f'{{{XDR_NS}}}clientData')
 
-                editAs = etree.SubElement(anchor, f'{{{XDR_NS}}}clientData')
+        elif anchors_firma and not img_bytes and log_fn:
+            log_fn(f"   ⚠ Se encontró {{{{firma}}}} en la plantilla pero no se subió imagen de firma para este registro")
 
-        archivos[drawing_name] = etree.tostring(
+        modificados[drawing_name] = etree.tostring(
             root, xml_declaration=True, encoding='UTF-8', standalone=True)
 
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zout:
-        for nombre, contenido in archivos.items():
-            zout.writestr(nombre, contenido)
-    return out.getvalue()
+    zin_buf.seek(0)
+    with zipfile.ZipFile(zin_buf, 'r') as zin:
+        return _zip_copy_preservando_formato(zin, modificados)
 
 
 # ─────────────────────────────────────────────
@@ -338,8 +380,15 @@ def llenar_docx(plantilla_bytes, datos, img_bytes, img_ext):
     CT_NS  = 'http://schemas.openxmlformats.org/package/2006/content-types'
     NS_PIC = 'http://schemas.openxmlformats.org/drawingml/2006/picture'
 
-    with zipfile.ZipFile(io.BytesIO(plantilla_bytes), 'r') as zin:
+    # Asegurar que img_ext tenga el punto
+    if img_ext and not img_ext.startswith('.'):
+        img_ext = '.' + img_ext
+
+    zin_buf = io.BytesIO(plantilla_bytes)
+    with zipfile.ZipFile(zin_buf, 'r') as zin:
         archivos = {n: zin.read(n) for n in zin.namelist()}
+
+    modificados = {}  # solo archivos que cambiamos
 
     root = etree.fromstring(archivos['word/document.xml'])
 
@@ -379,7 +428,7 @@ def llenar_docx(plantilla_bytes, datos, img_bytes, img_ext):
         img_mime = mime_map.get(img_ext, 'image/png')
         img_internal = f'word/media/firma_img{img_ext}'
         img_target   = f'media/firma_img{img_ext}'
-        archivos[img_internal] = img_bytes
+        modificados[img_internal] = img_bytes
 
         ct_root = etree.fromstring(archivos['[Content_Types].xml'])
         extension = img_ext.lstrip('.')
@@ -388,7 +437,7 @@ def llenar_docx(plantilla_bytes, datos, img_bytes, img_ext):
             nd = etree.SubElement(ct_root, f'{{{CT_NS}}}Default')
             nd.set('Extension', extension)
             nd.set('ContentType', img_mime)
-        archivos['[Content_Types].xml'] = etree.tostring(
+        modificados['[Content_Types].xml'] = etree.tostring(
             ct_root, xml_declaration=True, encoding='UTF-8', standalone=True)
 
         rels_name = 'word/_rels/document.xml.rels'
@@ -404,7 +453,7 @@ def llenar_docx(plantilla_bytes, datos, img_bytes, img_ext):
         new_rel.set('Id', rel_id)
         new_rel.set('Type', REL_TYPE)
         new_rel.set('Target', img_target)
-        archivos[rels_name] = etree.tostring(
+        modificados[rels_name] = etree.tostring(
             rels_root, xml_declaration=True, encoding='UTF-8', standalone=True)
 
         for docpr in root.iter(f'{{{NS_WP}}}docPr'):
@@ -448,14 +497,12 @@ def llenar_docx(plantilla_bytes, datos, img_bytes, img_ext):
                     gd.append(etree.fromstring(pic_xml))
                     break
 
-    archivos['word/document.xml'] = etree.tostring(
+    modificados['word/document.xml'] = etree.tostring(
         root, xml_declaration=True, encoding='UTF-8', standalone=True)
 
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zout:
-        for nombre, contenido in archivos.items():
-            zout.writestr(nombre, contenido)
-    return out.getvalue()
+    zin_buf.seek(0)
+    with zipfile.ZipFile(zin_buf, 'r') as zin:
+        return _zip_copy_preservando_formato(zin, modificados)
 
 
 # ─────────────────────────────────────────────
