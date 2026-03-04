@@ -509,16 +509,25 @@ def llenar_docx(plantilla_bytes, datos, img_bytes, img_ext):
 #  PROCESADOR PRINCIPAL (devuelve bytes)
 # ─────────────────────────────────────────────
 
-def procesar_plantilla(plantilla_nombre, plantilla_bytes, datos_fila, firmas_dict, campo_nombre, log_fn=None):
+def construir_nombre_archivo(plantilla_nombre, datos_fila, campos_nombre_archivo):
     ext = os.path.splitext(plantilla_nombre)[1].lower()
     nombre_base = os.path.splitext(plantilla_nombre)[0]
-    valor_nombre = formatear_valor(datos_fila.get(campo_nombre, "sin_nombre"))
-    valor_nombre_limpio = re.sub(r'[<>:"/\\|?*]', '_', valor_nombre).strip()
+    partes = []
+    for campo in campos_nombre_archivo:
+        valor = formatear_valor(datos_fila.get(campo, ""))
+        valor_limpio = re.sub(r'[<>:"/\\|?*]', '_', valor).strip()
+        if valor_limpio:
+            partes.append(valor_limpio)
+    sufijo = "_".join(partes) if partes else "sin_nombre"
+    return f"{nombre_base}_{sufijo}{ext}"
 
-    valor_firma_col = formatear_valor(datos_fila.get("firma", ""))
+
+def procesar_plantilla(plantilla_nombre, plantilla_bytes, datos_fila, firmas_dict,
+                       campos_nombre_archivo, campo_firma="firma", log_fn=None):
+    ext = os.path.splitext(plantilla_nombre)[1].lower()
+    valor_firma_col = formatear_valor(datos_fila.get(campo_firma, ""))
     img_bytes, img_ext = encontrar_firma(valor_firma_col, firmas_dict, log_fn)
-
-    nombre_archivo = f"{nombre_base}_{valor_nombre_limpio}{ext}"
+    nombre_archivo = construir_nombre_archivo(plantilla_nombre, datos_fila, campos_nombre_archivo)
 
     if ext == ".xlsx":
         resultado = llenar_xlsx_zip(plantilla_bytes, datos_fila)
@@ -547,10 +556,11 @@ with col1:
     st.subheader("1. Base de datos")
     excel_file = st.file_uploader("Sube el Excel con los datos", type=["xlsx", "xls", "xlsm"])
 
-    hoja_sel      = None
-    campo_nombre  = "nombre"
-    encabezados   = []
-    datos_filas   = []
+    hoja_sel               = None
+    campo_firma            = "firma"
+    campos_nombre_archivo  = []
+    encabezados            = []
+    datos_filas            = []
 
     if excel_file:
         try:
@@ -560,9 +570,8 @@ with col1:
             wb.close()
             excel_file.seek(0)
             hoja_sel = st.selectbox("Hoja", hojas)
-            campo_nombre = st.text_input("Campo nombre (para nombrar archivos)", value="nombre")
 
-            # Leer filas para preview y filtro
+            # Leer filas primero para poder mostrar selectboxes con columnas reales
             excel_file.seek(0)
             wb2 = openpyxl.load_workbook(io.BytesIO(excel_file.read()), data_only=True)
             ws2 = wb2[hoja_sel]
@@ -579,6 +588,30 @@ with col1:
                     if any(v is not None for v in fila)
                 ]
                 st.caption(f"✔ {len(datos_filas)} filas cargadas")
+
+                # ── Campo firma ──
+                firma_default_idx = next(
+                    (i for i, c in enumerate(encabezados) if "firma" in c.lower()), 0
+                )
+                campo_firma = st.selectbox(
+                    "Campo firma (columna con el nombre de la imagen de firma)",
+                    options=encabezados,
+                    index=firma_default_idx
+                )
+
+                # ── Campos nombre de archivo ──
+                campos_nombre_archivo = st.multiselect(
+                    "Campos para nombre del archivo (en el orden que elijas)",
+                    options=encabezados,
+                    default=[encabezados[0]],
+                    help="El nombre del archivo será: plantilla_VALOR1_VALOR2_...ext"
+                )
+                if campos_nombre_archivo and datos_filas:
+                    ejemplo = "_".join(
+                        re.sub(r'[<>:"/\\|?*]', "_", formatear_valor(datos_filas[0].get(c, ""))).strip()
+                        for c in campos_nombre_archivo
+                    )
+                    st.caption(f"Ejemplo: `plantilla_{ejemplo}.xlsx`")
 
         except Exception as e:
             st.error(f"No se pudo leer el Excel: {e}")
@@ -677,6 +710,8 @@ if generar:
 
         try:
             log(f"✔ {len(datos_filtrados)} filas a procesar | Campos: {', '.join(encabezados)}")
+            log(f"✔ Firma desde columna: '{campo_firma}'")
+            log(f"✔ Nombre de archivo desde: {campos_nombre_archivo}")
             log(f"✔ Firmas cargadas: {list(firmas_dict.keys()) or 'ninguna'}")
 
             # Generar archivos y empaquetar en ZIP
@@ -689,16 +724,30 @@ if generar:
                     plantilla_bytes  = plantilla_file.read()
                     log(f"\n📄 {plantilla_nombre}")
 
+                    # Contador de nombres usados para deduplicar dentro de esta plantilla
+                    nombres_usados = {}
+
                     for i, fila in enumerate(datos_filtrados):
                         try:
                             nombre_arch, contenido = procesar_plantilla(
                                 plantilla_nombre, plantilla_bytes, fila,
-                                firmas_dict, campo_nombre, log
+                                firmas_dict, campos_nombre_archivo, campo_firma, log
                             )
                             if nombre_arch and contenido:
-                                valor_firma = formatear_valor(fila.get("firma", ""))
+                                valor_firma = formatear_valor(fila.get(campo_firma, ""))
                                 _, img_ext_found = encontrar_firma(valor_firma, firmas_dict)
                                 subcarpeta = "con_firma" if img_ext_found else "sin_firma"
+
+                                # Deduplicar nombre dentro del mismo ZIP
+                                nombre_sin_ext = os.path.splitext(nombre_arch)[0]
+                                ext_arch = os.path.splitext(nombre_arch)[1]
+                                clave = f"{subcarpeta}/{nombre_arch}"
+                                if clave in nombres_usados:
+                                    nombres_usados[clave] += 1
+                                    nombre_arch = f"{nombre_sin_ext} ({nombres_usados[clave]}){ext_arch}"
+                                else:
+                                    nombres_usados[clave] = 0
+
                                 ruta_zip = f"{os.path.splitext(plantilla_nombre)[0]}/{subcarpeta}/{nombre_arch}"
                                 zout.writestr(ruta_zip, contenido)
                                 log(f"   ✔ {ruta_zip}")
