@@ -1,10 +1,8 @@
 import streamlit as st
 import os
 import re
-import copy
 import shutil
 import zipfile
-import tempfile
 from datetime import datetime, date
 from lxml import etree
 import io
@@ -16,7 +14,7 @@ XDR_NS = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'
 SS_NS  = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
 
 # ─────────────────────────────────────────────
-#  HELPERS GENERALES  (sin cambios vs original)
+#  HELPERS GENERALES
 # ─────────────────────────────────────────────
 
 def formatear_valor(valor):
@@ -36,7 +34,6 @@ def formatear_valor(valor):
 
 
 def encontrar_firma(nombre_valor, firmas_dict, log_fn=None):
-    """Busca imagen de firma en el dict {nombre_sin_ext: bytes} subido por el usuario."""
     if not nombre_valor or not firmas_dict:
         return None, None
     nombre_buscar = str(nombre_valor).strip().lower()
@@ -52,7 +49,7 @@ def encontrar_firma(nombre_valor, firmas_dict, log_fn=None):
 
 
 # ─────────────────────────────────────────────
-#  XLSX — PASO 1: Llenar celdas via ZIP XML
+#  XLSX
 # ─────────────────────────────────────────────
 
 def parse_cell_ref(ref):
@@ -120,23 +117,16 @@ def buscar_marcadores_en_xlsx(plantilla_bytes):
 
 
 def _zip_copy_preservando_formato(zin, archivos_modificados):
-    """
-    Recrea el ZIP preservando el compress_type original de cada entrada.
-    Solo los archivos en archivos_modificados (dict nombre->bytes) se reemplazan.
-    El resto se copia bit a bit desde el ZIP original.
-    """
     out = io.BytesIO()
     with zipfile.ZipFile(out, 'w') as zout:
         for info in zin.infolist():
             if info.filename in archivos_modificados:
-                # Archivo modificado: escribir nuevo contenido con compresión deflate
                 zout.writestr(
                     zipfile.ZipInfo(info.filename),
                     archivos_modificados[info.filename],
                     compress_type=zipfile.ZIP_DEFLATED
                 )
             else:
-                # Archivo sin modificar: copiar con compresión original
                 data = zin.read(info.filename)
                 zi = zipfile.ZipInfo(info.filename)
                 zi.compress_type = info.compress_type
@@ -145,15 +135,11 @@ def _zip_copy_preservando_formato(zin, archivos_modificados):
 
 
 def llenar_xlsx_zip(plantilla_bytes, datos):
-    """Rellena celdas y devuelve bytes del xlsx modificado, preservando formato."""
     SS_STR = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
-
     zin_buf = io.BytesIO(plantilla_bytes)
     with zipfile.ZipFile(zin_buf, 'r') as zin:
         archivos = {n: zin.read(n) for n in zin.namelist()}
-
-    modificados = {}  # solo los que cambiamos
-
+    modificados = {}
     if 'xl/sharedStrings.xml' in archivos:
         root = etree.fromstring(archivos['xl/sharedStrings.xml'])
         cambio = False
@@ -178,7 +164,6 @@ def llenar_xlsx_zip(plantilla_bytes, datos):
         if cambio:
             modificados['xl/sharedStrings.xml'] = etree.tostring(
                 root, xml_declaration=True, encoding='UTF-8', standalone=True)
-
     marcadores, _ = buscar_marcadores_en_xlsx(plantilla_bytes)
     for sheet_name, celdas in marcadores.items():
         if not celdas:
@@ -188,8 +173,6 @@ def llenar_xlsx_zip(plantilla_bytes, datos):
             valor = datos.get(campo, "")
             sheet_xml = set_cell_in_xml(sheet_xml, cell_ref, valor)
         modificados[sheet_name] = sheet_xml
-
-    # Reconstruir ZIP preservando compresión original de cada archivo
     zin_buf.seek(0)
     with zipfile.ZipFile(zin_buf, 'r') as zin:
         return _zip_copy_preservando_formato(zin, modificados)
@@ -224,34 +207,24 @@ def insertar_firmas_en_drawing_xlsx(xlsx_bytes, img_bytes, img_ext, datos, log_f
     REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image'
     CT_NS    = 'http://schemas.openxmlformats.org/package/2006/content-types'
     NS_PIC   = 'http://schemas.openxmlformats.org/drawingml/2006/picture'
-
+    if img_ext and not img_ext.startswith('.'):
+        img_ext = '.' + img_ext
     zin_buf = io.BytesIO(xlsx_bytes)
     with zipfile.ZipFile(zin_buf, 'r') as zin:
         archivos = {n: zin.read(n) for n in zin.namelist()}
-
     drawing_names = [n for n in archivos if re.match(r'xl/drawings/drawing\d+\.xml$', n)]
     if not drawing_names:
         zin_buf.seek(0)
         with zipfile.ZipFile(zin_buf, 'r') as zin:
             return _zip_copy_preservando_formato(zin, {})
-
     mime_map = {'.png': 'image/png', '.jpg': 'image/jpeg',
                 '.jpeg': 'image/jpeg', '.bmp': 'image/bmp', '.tiff': 'image/tiff'}
-
-    # Asegurar que img_ext tenga el punto
-    if img_ext and not img_ext.startswith('.'):
-        img_ext = '.' + img_ext
-
     img_mime = mime_map.get(img_ext, 'image/png') if img_ext else 'image/png'
     img_internal_name = f"firma_img{img_ext}" if img_ext else None
     img_zip_path = f"xl/media/{img_internal_name}" if img_internal_name else None
-
     modificados = {}
-
     for drawing_name in drawing_names:
         root = etree.fromstring(archivos[drawing_name])
-
-        # Reemplazar {{campo}} de texto en shapes
         for t_el in root.iter(f'{{{NS_A}}}t'):
             if not t_el.text or '{{' not in t_el.text:
                 continue
@@ -261,27 +234,17 @@ def insertar_firmas_en_drawing_xlsx(xlsx_bytes, img_bytes, img_ext, datos, log_f
                 marcador = '{{' + campo + '}}'
                 if marcador in t_el.text:
                     t_el.text = t_el.text.replace(marcador, formatear_valor(valor))
-
-        # Buscar anchors con {{firma}}
         anchors_firma = []
         for anchor in root.findall(f'{{{XDR_NS}}}twoCellAnchor') + root.findall(f'{{{XDR_NS}}}oneCellAnchor'):
             for t_el in anchor.iter(f'{{{NS_A}}}t'):
                 if t_el.text and '{{firma}}' in t_el.text:
                     anchors_firma.append(anchor)
                     break
-
-        if log_fn and anchors_firma:
-            log_fn(f"   🔍 {len(anchors_firma)} cuadro(s) {{{{firma}}}} encontrado(s)")
-
         if anchors_firma and img_bytes and img_ext:
             drawing_basename = os.path.basename(drawing_name)
             rels_name = f"xl/drawings/_rels/{drawing_basename}.rels"
             img_target = f"../media/{img_internal_name}"
-
-            # Agregar imagen al ZIP
             modificados[img_zip_path] = img_bytes
-
-            # Content-Types
             ct_root = etree.fromstring(archivos['[Content_Types].xml'])
             extension = img_ext.lstrip('.')
             existentes = {e.get('Extension') for e in ct_root.findall(f'{{{CT_NS}}}Default')}
@@ -291,15 +254,12 @@ def insertar_firmas_en_drawing_xlsx(xlsx_bytes, img_bytes, img_ext, datos, log_f
                 nd.set('ContentType', img_mime)
             modificados['[Content_Types].xml'] = etree.tostring(
                 ct_root, xml_declaration=True, encoding='UTF-8', standalone=True)
-
-            # Relaciones del drawing
             if rels_name in archivos:
                 rels_root = etree.fromstring(archivos[rels_name])
             else:
                 rels_root = etree.fromstring(
                     b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                     b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>')
-
             rel_id = 'rFirma1'
             ids_existentes = {e.get('Id') for e in rels_root.findall(f'{{{REL_NS}}}Relationship')}
             if rel_id not in ids_existentes:
@@ -309,32 +269,24 @@ def insertar_firmas_en_drawing_xlsx(xlsx_bytes, img_bytes, img_ext, datos, log_f
                 new_rel.set('Target', img_target)
             modificados[rels_name] = etree.tostring(
                 rels_root, xml_declaration=True, encoding='UTF-8', standalone=True)
-
             for anchor in anchors_firma:
                 pos = _extraer_posicion_anchor(anchor)
                 if pos is None:
                     continue
-
                 to_col    = pos.get('to_col',    pos['col'] + 2)
                 to_colOff = pos.get('to_colOff', 0)
                 to_row    = pos.get('to_row',    pos['row'] + 3)
                 to_rowOff = pos.get('to_rowOff', 0)
-
-                # Conservar <from> y <to>, eliminar resto
                 from_el_orig = anchor.find(f'{{{XDR_NS}}}from')
                 for child in list(anchor):
                     anchor.remove(child)
                 if from_el_orig is not None:
                     anchor.append(from_el_orig)
-
-                # Reconstruir <to>
                 to_el = etree.SubElement(anchor, f'{{{XDR_NS}}}to')
                 for tag, val in [('col', to_col), ('colOff', to_colOff),
                                   ('row', to_row), ('rowOff', to_rowOff)]:
                     child = etree.SubElement(to_el, f'{{{XDR_NS}}}{tag}')
                     child.text = str(val)
-
-                # Insertar imagen
                 pic_id = 100
                 pic_xml = (
                     f'<xdr:pic xmlns:xdr="{XDR_NS}" xmlns:a="{NS_A}" xmlns:r="{NS_R}" xmlns:pic="{NS_PIC}">'
@@ -354,13 +306,8 @@ def insertar_firmas_en_drawing_xlsx(xlsx_bytes, img_bytes, img_ext, datos, log_f
                 )
                 anchor.append(etree.fromstring(pic_xml))
                 etree.SubElement(anchor, f'{{{XDR_NS}}}clientData')
-
-        elif anchors_firma and not img_bytes and log_fn:
-            log_fn(f"   ⚠ Se encontró {{{{firma}}}} en la plantilla pero no se subió imagen de firma para este registro")
-
         modificados[drawing_name] = etree.tostring(
             root, xml_declaration=True, encoding='UTF-8', standalone=True)
-
     zin_buf.seek(0)
     with zipfile.ZipFile(zin_buf, 'r') as zin:
         return _zip_copy_preservando_formato(zin, modificados)
@@ -379,20 +326,13 @@ def llenar_docx(plantilla_bytes, datos, img_bytes, img_ext):
     REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image'
     CT_NS  = 'http://schemas.openxmlformats.org/package/2006/content-types'
     NS_PIC = 'http://schemas.openxmlformats.org/drawingml/2006/picture'
-
-    # Asegurar que img_ext tenga el punto
     if img_ext and not img_ext.startswith('.'):
         img_ext = '.' + img_ext
-
     zin_buf = io.BytesIO(plantilla_bytes)
     with zipfile.ZipFile(zin_buf, 'r') as zin:
         archivos = {n: zin.read(n) for n in zin.namelist()}
-
-    modificados = {}  # solo archivos que cambiamos
-
+    modificados = {}
     root = etree.fromstring(archivos['word/document.xml'])
-
-    # ── 1. Reemplazar {{campo}} en párrafos ──
     for para in root.iter(f'{{{NS_W}}}p'):
         runs = para.findall(f'.//{{{NS_W}}}r')
         if not runs:
@@ -420,8 +360,6 @@ def llenar_docx(plantilla_bytes, datos, img_bytes, img_ext):
         for r in runs[1:]:
             for t in r.findall(f'{{{NS_W}}}t'):
                 t.text = ''
-
-    # ── 2. Insertar firma en anchor {{firma}} ──
     if img_bytes and img_ext:
         mime_map = {'.png': 'image/png', '.jpg': 'image/jpeg',
                     '.jpeg': 'image/jpeg', '.bmp': 'image/bmp', '.tiff': 'image/tiff'}
@@ -429,7 +367,6 @@ def llenar_docx(plantilla_bytes, datos, img_bytes, img_ext):
         img_internal = f'word/media/firma_img{img_ext}'
         img_target   = f'media/firma_img{img_ext}'
         modificados[img_internal] = img_bytes
-
         ct_root = etree.fromstring(archivos['[Content_Types].xml'])
         extension = img_ext.lstrip('.')
         existentes = {e.get('Extension') for e in ct_root.findall(f'{{{CT_NS}}}Default')}
@@ -439,12 +376,10 @@ def llenar_docx(plantilla_bytes, datos, img_bytes, img_ext):
             nd.set('ContentType', img_mime)
         modificados['[Content_Types].xml'] = etree.tostring(
             ct_root, xml_declaration=True, encoding='UTF-8', standalone=True)
-
         rels_name = 'word/_rels/document.xml.rels'
         rels_root = etree.fromstring(archivos[rels_name]) if rels_name in archivos else etree.fromstring(
             b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>')
-
         rel_id = 'rFirmaImg1'
         ids_existentes = {e.get('Id') for e in rels_root.findall(f'{{{REL_NS}}}Relationship')}
         while rel_id in ids_existentes:
@@ -455,7 +390,6 @@ def llenar_docx(plantilla_bytes, datos, img_bytes, img_ext):
         new_rel.set('Target', img_target)
         modificados[rels_name] = etree.tostring(
             rels_root, xml_declaration=True, encoding='UTF-8', standalone=True)
-
         for docpr in root.iter(f'{{{NS_WP}}}docPr'):
             if '{{firma}}' not in (docpr.get('name') or ''):
                 continue
@@ -496,17 +430,15 @@ def llenar_docx(plantilla_bytes, datos, img_bytes, img_ext):
                     )
                     gd.append(etree.fromstring(pic_xml))
                     break
-
     modificados['word/document.xml'] = etree.tostring(
         root, xml_declaration=True, encoding='UTF-8', standalone=True)
-
     zin_buf.seek(0)
     with zipfile.ZipFile(zin_buf, 'r') as zin:
         return _zip_copy_preservando_formato(zin, modificados)
 
 
 # ─────────────────────────────────────────────
-#  PROCESADOR PRINCIPAL (devuelve bytes)
+#  PROCESADOR PRINCIPAL
 # ─────────────────────────────────────────────
 
 def construir_nombre_archivo(plantilla_nombre, datos_fila, campos_nombre_archivo):
@@ -528,7 +460,6 @@ def procesar_plantilla(plantilla_nombre, plantilla_bytes, datos_fila, firmas_dic
     valor_firma_col = formatear_valor(datos_fila.get(campo_firma, ""))
     img_bytes, img_ext = encontrar_firma(valor_firma_col, firmas_dict, log_fn)
     nombre_archivo = construir_nombre_archivo(plantilla_nombre, datos_fila, campos_nombre_archivo)
-
     if ext == ".xlsx":
         resultado = llenar_xlsx_zip(plantilla_bytes, datos_fila)
         resultado = insertar_firmas_en_drawing_xlsx(resultado, img_bytes, img_ext, datos_fila, log_fn)
@@ -536,31 +467,285 @@ def procesar_plantilla(plantilla_nombre, plantilla_bytes, datos_fila, firmas_dic
         resultado = llenar_docx(plantilla_bytes, datos_fila, img_bytes, img_ext)
     else:
         return None, None
-
     return nombre_archivo, resultado
 
 
 # ─────────────────────────────────────────────
-#  INTERFAZ STREAMLIT
+#  ESTILOS CSS PERSONALIZADOS
 # ─────────────────────────────────────────────
 
-st.set_page_config(page_title="Generador de Documentos", page_icon="📄", layout="wide")
+st.set_page_config(
+    page_title="Generador de Documentos",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-st.title("📄 Generador de Documentos")
-st.caption("Rellena plantillas Excel y Word desde tu base de datos")
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
 
-# ── Columnas de configuración ──
-col1, col2 = st.columns(2)
+html, body, [class*="css"] {
+    font-family: 'DM Sans', sans-serif;
+}
+
+/* Fondo general */
+.stApp {
+    background: #0f1117;
+}
+
+/* Header principal */
+.app-header {
+    background: linear-gradient(135deg, #1a1f2e 0%, #16213e 50%, #0f3460 100%);
+    border: 1px solid rgba(99, 179, 237, 0.15);
+    border-radius: 16px;
+    padding: 32px 40px;
+    margin-bottom: 28px;
+    position: relative;
+    overflow: hidden;
+}
+.app-header::before {
+    content: '';
+    position: absolute;
+    top: -50%;
+    right: -10%;
+    width: 400px;
+    height: 400px;
+    background: radial-gradient(circle, rgba(99,179,237,0.08) 0%, transparent 70%);
+    pointer-events: none;
+}
+.app-header h1 {
+    color: #e2e8f0;
+    font-size: 26px;
+    font-weight: 600;
+    margin: 0 0 6px 0;
+    letter-spacing: -0.5px;
+}
+.app-header p {
+    color: #718096;
+    font-size: 14px;
+    margin: 0;
+    font-weight: 300;
+}
+.app-header .badge {
+    display: inline-block;
+    background: rgba(99,179,237,0.12);
+    border: 1px solid rgba(99,179,237,0.3);
+    color: #63b3ed;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 3px 10px;
+    border-radius: 20px;
+    margin-bottom: 12px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+}
+
+/* Tarjetas de sección */
+.section-card {
+    background: #1a1f2e;
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 16px;
+    transition: border-color 0.2s;
+}
+.section-card:hover {
+    border-color: rgba(99,179,237,0.2);
+}
+.section-label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 16px;
+}
+.section-number {
+    background: linear-gradient(135deg, #3182ce, #63b3ed);
+    color: white;
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 600;
+    flex-shrink: 0;
+}
+.section-title {
+    color: #e2e8f0;
+    font-size: 15px;
+    font-weight: 500;
+}
+
+/* Widgets de Streamlit */
+.stFileUploader > div {
+    background: #111827 !important;
+    border: 1px dashed rgba(99,179,237,0.25) !important;
+    border-radius: 10px !important;
+    transition: border-color 0.2s !important;
+}
+.stFileUploader > div:hover {
+    border-color: rgba(99,179,237,0.5) !important;
+}
+.stSelectbox > div > div,
+.stMultiSelect > div > div {
+    background: #111827 !important;
+    border-color: rgba(255,255,255,0.1) !important;
+    color: #e2e8f0 !important;
+}
+label {
+    color: #a0aec0 !important;
+    font-size: 13px !important;
+    font-weight: 400 !important;
+}
+
+/* Botón primario */
+.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #2b6cb0, #3182ce) !important;
+    border: none !important;
+    border-radius: 10px !important;
+    color: white !important;
+    font-family: 'DM Sans', sans-serif !important;
+    font-size: 15px !important;
+    font-weight: 600 !important;
+    padding: 14px 28px !important;
+    letter-spacing: 0.3px !important;
+    transition: all 0.2s !important;
+    box-shadow: 0 4px 20px rgba(49,130,206,0.35) !important;
+}
+.stButton > button[kind="primary"]:hover {
+    background: linear-gradient(135deg, #3182ce, #4299e1) !important;
+    box-shadow: 0 6px 28px rgba(49,130,206,0.5) !important;
+    transform: translateY(-1px) !important;
+}
+
+/* Botón descarga */
+.stDownloadButton > button {
+    background: linear-gradient(135deg, #276749, #38a169) !important;
+    border: none !important;
+    border-radius: 10px !important;
+    color: white !important;
+    font-family: 'DM Sans', sans-serif !important;
+    font-size: 14px !important;
+    font-weight: 600 !important;
+    padding: 12px 24px !important;
+    box-shadow: 0 4px 20px rgba(56,161,105,0.35) !important;
+    transition: all 0.2s !important;
+}
+.stDownloadButton > button:hover {
+    background: linear-gradient(135deg, #38a169, #48bb78) !important;
+    transform: translateY(-1px) !important;
+}
+
+/* Área de log */
+.stCode {
+    background: #0d1117 !important;
+    border: 1px solid rgba(255,255,255,0.06) !important;
+    border-radius: 10px !important;
+    font-family: 'DM Mono', monospace !important;
+    font-size: 12px !important;
+}
+
+/* Info / warning / success */
+.stInfo {
+    background: rgba(49,130,206,0.1) !important;
+    border-color: rgba(49,130,206,0.3) !important;
+    border-radius: 10px !important;
+}
+.stSuccess {
+    background: rgba(56,161,105,0.1) !important;
+    border-color: rgba(56,161,105,0.3) !important;
+    border-radius: 10px !important;
+}
+.stWarning {
+    background: rgba(237,137,54,0.1) !important;
+    border-color: rgba(237,137,54,0.3) !important;
+    border-radius: 10px !important;
+}
+
+/* Divisor */
+hr {
+    border-color: rgba(255,255,255,0.06) !important;
+    margin: 24px 0 !important;
+}
+
+/* Dataframe */
+.stDataFrame {
+    border-radius: 10px !important;
+    overflow: hidden !important;
+}
+
+/* Caption */
+.stCaption {
+    color: #4a5568 !important;
+}
+
+/* Stat chips */
+.stat-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(99,179,237,0.08);
+    border: 1px solid rgba(99,179,237,0.2);
+    color: #63b3ed;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 12px;
+    border-radius: 20px;
+    margin: 4px 4px 0 0;
+}
+
+/* Expander */
+.streamlit-expanderHeader {
+    background: #1a1f2e !important;
+    border-radius: 8px !important;
+    color: #a0aec0 !important;
+    font-size: 13px !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+#  HEADER
+# ─────────────────────────────────────────────
+
+st.markdown("""
+<div class="app-header">
+    <div class="badge">📄 Herramienta interna</div>
+    <h1>Generador de Documentos</h1>
+    <p>Rellena plantillas Excel y Word automáticamente desde tu base de datos</p>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+#  SECCIÓN 1 y 2 — en columnas
+# ─────────────────────────────────────────────
+
+col1, col2 = st.columns(2, gap="medium")
+
+hoja_sel              = None
+campo_firma           = "firma"
+campos_nombre_archivo = []
+encabezados           = []
+datos_filas           = []
 
 with col1:
-    st.subheader("1. Base de datos")
-    excel_file = st.file_uploader("Sube el Excel con los datos", type=["xlsx", "xls", "xlsm"])
+    st.markdown("""
+    <div class="section-label">
+        <div class="section-number">1</div>
+        <span class="section-title">Base de datos</span>
+    </div>
+    """, unsafe_allow_html=True)
 
-    hoja_sel               = None
-    campo_firma            = "firma"
-    campos_nombre_archivo  = []
-    encabezados            = []
-    datos_filas            = []
+    excel_file = st.file_uploader(
+        "Sube el Excel con los datos",
+        type=["xlsx", "xls", "xlsm"],
+        label_visibility="collapsed",
+        help="Archivo Excel con las filas de productores o registros a procesar"
+    )
 
     if excel_file:
         try:
@@ -569,9 +754,9 @@ with col1:
             hojas = wb.sheetnames
             wb.close()
             excel_file.seek(0)
+
             hoja_sel = st.selectbox("Hoja", hojas)
 
-            # Leer filas primero para poder mostrar selectboxes con columnas reales
             excel_file.seek(0)
             wb2 = openpyxl.load_workbook(io.BytesIO(excel_file.read()), data_only=True)
             ws2 = wb2[hoja_sel]
@@ -587,25 +772,32 @@ with col1:
                     for fila in filas_raw[1:]
                     if any(v is not None for v in fila)
                 ]
-                st.caption(f"✔ {len(datos_filas)} filas cargadas")
 
-                # ── Campo firma ──
+                st.markdown(f"""
+                <div style="margin-top:8px;">
+                    <span class="stat-chip">✔ {len(datos_filas)} filas</span>
+                    <span class="stat-chip">📋 {len(encabezados)} columnas</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+                st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
                 firma_default_idx = next(
                     (i for i, c in enumerate(encabezados) if "firma" in c.lower()), 0
                 )
                 campo_firma = st.selectbox(
-                    "Campo firma (columna con el nombre de la imagen de firma)",
+                    "Columna de firma",
                     options=encabezados,
                     index=firma_default_idx
                 )
 
-                # ── Campos nombre de archivo ──
                 campos_nombre_archivo = st.multiselect(
-                    "Campos para nombre del archivo (en el orden que elijas)",
+                    "Campos para nombre del archivo",
                     options=encabezados,
                     default=[encabezados[0]],
-                    help="El nombre del archivo será: plantilla_VALOR1_VALOR2_...ext"
+                    help="El nombre del archivo generado usará estos campos"
                 )
+
                 if campos_nombre_archivo and datos_filas:
                     ejemplo = "_".join(
                         re.sub(r'[<>:"/\\|?*]', "_", formatear_valor(datos_filas[0].get(c, ""))).strip()
@@ -617,37 +809,80 @@ with col1:
             st.error(f"No se pudo leer el Excel: {e}")
 
 with col2:
-    st.subheader("2. Plantillas")
+    st.markdown("""
+    <div class="section-label">
+        <div class="section-number">2</div>
+        <span class="section-title">Plantillas</span>
+    </div>
+    """, unsafe_allow_html=True)
+
     plantillas_files = st.file_uploader(
-        "Sube una o más plantillas (.xlsx / .docx)",
+        "Plantillas",
         type=["xlsx", "docx"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        help="Sube una o más plantillas con marcadores {{campo}}"
     )
 
-st.subheader("3. Firmas (opcional)")
+    if plantillas_files:
+        st.markdown(f"""
+        <div style="margin-top:8px;">
+            <span class="stat-chip">📎 {len(plantillas_files)} plantilla(s) cargada(s)</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+#  SECCIÓN 3 — Firmas
+# ─────────────────────────────────────────────
+
+st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+st.markdown("""
+<div class="section-label">
+    <div class="section-number">3</div>
+    <span class="section-title">Firmas <span style="color:#4a5568; font-size:13px; font-weight:300">(opcional)</span></span>
+</div>
+""", unsafe_allow_html=True)
+
 firmas_files = st.file_uploader(
-    "Sube las imágenes de firma (el nombre del archivo debe coincidir con el campo 'firma' del Excel)",
+    "Firmas",
     type=["png", "jpg", "jpeg", "bmp", "tiff"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
+    label_visibility="collapsed",
+    help="El nombre del archivo debe coincidir con el valor en la columna de firma del Excel"
 )
 
-# ── Filtro ──
-st.subheader("4. Filtro (opcional)")
+if firmas_files:
+    st.markdown(f"""
+    <div style="margin-top:8px; margin-bottom:4px;">
+        <span class="stat-chip">🖊 {len(firmas_files)} firma(s) cargada(s)</span>
+    </div>
+    """, unsafe_allow_html=True)
 
-datos_filtrados = datos_filas  # por defecto: todas las filas
+
+# ─────────────────────────────────────────────
+#  SECCIÓN 4 — Filtro
+# ─────────────────────────────────────────────
+
+datos_filtrados = datos_filas
 
 if datos_filas and encabezados:
-    col_f1, col_f2 = st.columns([1, 2])
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+    st.markdown("""
+    <div class="section-label">
+        <div class="section-number">4</div>
+        <span class="section-title">Filtro <span style="color:#4a5568; font-size:13px; font-weight:300">(opcional)</span></span>
+    </div>
+    """, unsafe_allow_html=True)
 
+    col_f1, col_f2 = st.columns([1, 2])
     with col_f1:
         usar_filtro = st.checkbox("Filtrar filas antes de generar")
 
     if usar_filtro:
         with col_f1:
             columna_filtro = st.selectbox("Columna a filtrar", encabezados)
-
         if columna_filtro:
-            # Valores únicos de esa columna (formateados para mostrar)
             valores_unicos = sorted(
                 set(
                     formatear_valor(fila.get(columna_filtro))
@@ -655,46 +890,48 @@ if datos_filas and encabezados:
                     if fila.get(columna_filtro) is not None and str(fila.get(columna_filtro)).strip() != ""
                 )
             )
-
             with col_f2:
                 valores_sel = st.multiselect(
-                    f"Valores de '{columna_filtro}' a incluir",
+                    f"Valores de '{columna_filtro}'",
                     options=valores_unicos,
                     default=valores_unicos,
-                    help="Selecciona uno o varios valores. Solo se generarán documentos para las filas que coincidan."
                 )
-
             if valores_sel:
                 datos_filtrados = [
                     fila for fila in datos_filas
                     if formatear_valor(fila.get(columna_filtro)) in valores_sel
                 ]
-                st.info(f"🔎 {len(datos_filtrados)} de {len(datos_filas)} filas seleccionadas con el filtro")
+                st.info(f"🔎 {len(datos_filtrados)} de {len(datos_filas)} filas seleccionadas")
             else:
                 datos_filtrados = []
-                st.warning("No hay valores seleccionados. No se generará ningún documento.")
+                st.warning("Sin valores seleccionados — no se generará ningún documento.")
 
-    # Preview de filas que se van a procesar
-    with st.expander(f"👁 Ver filas a procesar ({len(datos_filtrados)})", expanded=False):
+    with st.expander(f"👁  Ver filas a procesar ({len(datos_filtrados)})", expanded=False):
         if datos_filtrados:
             import pandas as pd
             st.dataframe(pd.DataFrame(datos_filtrados), use_container_width=True)
         else:
             st.write("Sin filas.")
 
-# ── Botón generar ──
+
+# ─────────────────────────────────────────────
+#  BOTÓN GENERAR
+# ─────────────────────────────────────────────
+
+st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 st.divider()
-generar = st.button("⚡ GENERAR DOCUMENTOS", type="primary", use_container_width=True)
+
+generar = st.button("⚡  GENERAR DOCUMENTOS", type="primary", use_container_width=True)
 
 if generar:
     if not excel_file:
-        st.warning("Sube el Excel de datos.")
+        st.warning("⚠ Sube el Excel de datos.")
     elif not hoja_sel:
-        st.warning("Selecciona la hoja.")
+        st.warning("⚠ Selecciona la hoja.")
     elif not plantillas_files:
-        st.warning("Sube al menos una plantilla.")
+        st.warning("⚠ Sube al menos una plantilla.")
     elif not datos_filtrados:
-        st.warning("No hay filas para procesar. Revisa el filtro.")
+        st.warning("⚠ No hay filas para procesar.")
     else:
         log_area = st.empty()
         logs = []
@@ -703,7 +940,6 @@ if generar:
             logs.append(msg)
             log_area.code("\n".join(logs), language=None)
 
-        # Leer firmas → dict {nombre_archivo: bytes}
         firmas_dict = {}
         for f in (firmas_files or []):
             firmas_dict[f.name] = f.read()
@@ -714,7 +950,6 @@ if generar:
             log(f"✔ Nombre de archivo desde: {campos_nombre_archivo}")
             log(f"✔ Firmas cargadas: {list(firmas_dict.keys()) or 'ninguna'}")
 
-            # Generar archivos y empaquetar en ZIP
             zip_buffer = io.BytesIO()
             total = 0
 
@@ -724,7 +959,6 @@ if generar:
                     plantilla_bytes  = plantilla_file.read()
                     log(f"\n📄 {plantilla_nombre}")
 
-                    # Contador de nombres usados para deduplicar dentro de esta plantilla
                     nombres_usados = {}
 
                     for i, fila in enumerate(datos_filtrados):
@@ -738,7 +972,6 @@ if generar:
                                 _, img_ext_found = encontrar_firma(valor_firma, firmas_dict)
                                 subcarpeta = "con_firma" if img_ext_found else "sin_firma"
 
-                                # Deduplicar nombre dentro del mismo ZIP
                                 nombre_sin_ext = os.path.splitext(nombre_arch)[0]
                                 ext_arch = os.path.splitext(nombre_arch)[1]
                                 clave = f"{subcarpeta}/{nombre_arch}"
@@ -759,9 +992,9 @@ if generar:
 
             log(f"\n✅ {total} archivos generados")
 
-            st.success(f"✅ {total} archivos generados correctamente")
+            st.success(f"✅ {total} documentos generados correctamente")
             st.download_button(
-                label="📥 Descargar todos los documentos (.zip)",
+                label="📥  Descargar todos los documentos (.zip)",
                 data=zip_buffer.getvalue(),
                 file_name="documentos_generados.zip",
                 mime="application/zip",
